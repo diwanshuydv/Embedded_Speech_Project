@@ -1,9 +1,9 @@
 # Embedded Project - Standalone STM32F429ZI LCD
 
 This project is a firmware for the STM32F429ZI (usually found on the STM32F429I-DISCO board) to drive the onboard LCD.
-# Current 
+# <span style="color:red">Current Issue</span>
 1. Not able to send the data to the board the python script is stuck after sending and not able to send the data onto the ACM port.
-2. Urgent FIX needed.
+2. <span style="color:red">Urgent FIX needed.</span>
 ## Prerequisites
 
 To build and flash this project, you need the ARM bare-metal toolchain and OpenOCD.
