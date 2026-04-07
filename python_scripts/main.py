@@ -1,22 +1,23 @@
 import cv2, serial, struct, time, numpy as np
-
-ser = serial.Serial("/dev/ttyACM0", 115200, timeout=0.1)
+#For Linux:
+# ser = serial.Serial("/dev/ttyACM0", 115200, timeout=0.1)
+#For Mac:
+ser = serial.Serial("/dev/cu.usbmodem11403", 115200, timeout=0.1)
 ser.reset_input_buffer()
 ser.reset_output_buffer()
-cap = cv2.VideoCapture("http://172.31.75.172:8080/video")
-
+#For phone app based:
+# cap = cv2.VideoCapture("http://172.31.75.172:8080/video") # Ensure this IP is still correct
+#For laptop camera based:
+cap = cv2.VideoCapture(0)
 print("Waiting for STM32 'READY' signal...")
 while True:
     if ser.in_waiting > 0:
         line = ser.readline().decode('utf-8', errors='ignore')
-        print(line)
+        print(line, end="")
         if "READY_TO_RECEIVE" in line:
-            print("✅ STM32 is READY. Starting Stream...")
+            print("\n✅ STM32 is READY. Starting Stream...")
             break
     time.sleep(0.01)
-
-# Clear any leftover junk from the READY strings
-ser.reset_input_buffer()
 
 while True:
     # Flush the OpenCV buffer to get the freshest frame
@@ -30,18 +31,21 @@ while True:
     small = cv2.resize(gray, (96, 96))
     img_data = small.flatten().tobytes()
 
-    # Clear stale responses from STM32 before sending next frame
     ser.reset_input_buffer()
 
-    # 📤 SEND PACKET
-    # Header(2) + Size(2) + Pixels(9216)
-    packet = b'\xAA\x55' + struct.pack('<H', len(img_data)) + img_data
+    # 📤 SEND HEADER
+    header = b'\xAA\x55' + struct.pack('<H', len(img_data))
+    print(f"Sending Frame...", end="", flush=True)
+    ser.write(header)
     
-    print(f"Sending Frame ({len(packet)} bytes)...", end="", flush=True)
-    ser.write(packet)
-    ser.flush()
-    print(" Sent.")
-    time.sleep(0.5)
+    # 📤 SEND PIXELS IN CHUNKS (This is the fix)
+    chunk_size = 512
+    for i in range(0, len(img_data), chunk_size):
+        ser.write(img_data[i:i+chunk_size])
+        ser.flush()
+        time.sleep(0.005) # 5ms delay allows STM32 hardware buffer to clear
+        
+    print(" Sent. Waiting for AI...")
 
     # 📥 WAIT FOR AI RESULT (Max 5 seconds)
     start_time = time.time()
@@ -54,8 +58,7 @@ while True:
                 idx = rx_buffer.find(b'\xBB\x66')
                 if idx + 2 < len(rx_buffer):
                     res = "PERSON" if rx_buffer[idx+2] == 1 else "NONE"
-                    print(f"🤖 AI RESULT: {res}")
+                    print(f"🤖 AI RESULT: {res}\n")
                     break
     
-    # Small delay to keep the loop stable
-    time.sleep(5)
+    time.sleep(0.1) # Shorter delay for a better framerate
