@@ -25,7 +25,7 @@ extern "C" int _write(int file, char *ptr, int len) {
 #include "model_data.h" 
 
 #define SDRAM_BASE 0xD0000000
-#define IMG_MAX 9216 
+#define IMG_MAX 27648 
 uint8_t* image_buffer = (uint8_t*)(SDRAM_BASE + 0x80000); // offset by 512KB for LCD buffer protection
 
 
@@ -89,36 +89,52 @@ int main(void) {
     
     TfLiteTensor* input = interpreter.input(0);
     TfLiteTensor* output = interpreter.output(0); 
-    int x_offset = (GFX_WIDTH - 96) / 2;
-    int y_offset = (GFX_HEIGHT - 96) / 2;
+    
+    // Pre-compute lookup tables for nearest-neighbor scaling 96 -> 320 and 96 -> 240
+    // This maps each screen pixel back to its source pixel in the 96x96 image.
+    uint8_t src_x_lut[GFX_WIDTH];   // 320 entries
+    uint8_t src_y_lut[GFX_HEIGHT];  // 240 entries
+    for (int sx = 0; sx < GFX_WIDTH; sx++)
+        src_x_lut[sx] = (uint8_t)((sx * 96) / GFX_WIDTH);
+    for (int sy = 0; sy < GFX_HEIGHT; sy++)
+        src_y_lut[sy] = (uint8_t)((sy * 96) / GFX_HEIGHT);
     
     while (1) {
-        // Run a dummy inference or just clear string
-        gfx_setCursor(10, 30);
+       gfx_setCursor(10, 30);
         gfx_setTextColor(0xFFFF, 0x0000);
         gfx_puts((char*)"WAITING FOR SERIAL INPUT ");
-        lcd_show_frame();
 
-        // 1. Hunt for 0xAA
-        if ((uint8_t)usart_read_char() != 0xAA) continue;
-        
-        // 2. Found 0xAA! Now look for 0x55
-        if ((uint8_t)usart_read_char() != 0x55) continue;
+        // 🔥 FIX 1: The FLUSH block is completely deleted.
+
+        // 🔥 FIX 2: Sliding-window header search. 
+        // It safely chews through garbage bytes until it perfectly locks onto 0xAA 0x55.
+        uint8_t sync1 = 0;
+        uint8_t sync2 = 0;
+        while (true) {
+            sync1 = sync2;
+            sync2 = (uint8_t)usart_read_char();
+            if (sync1 == 0xAA && sync2 == 0x55) {
+                break; // Header locked!
+            }
+        }
 
         // 3. Header confirmed. Read Size (2 bytes)
         uint8_t size_low = usart_read_char();
         uint8_t size_high = usart_read_char();
         uint16_t expected_size = (size_high << 8) | size_low;
 
-        if (expected_size != 9216) continue; // Safety check
+        if (expected_size != 27648) {
+            continue; // Wrong size, wait for the next frame
+        }
 
         // 4. Read Pixels using DMA
+        dma_rx_complete = 0;
+        // dma_rx_error = 0; // 🔥 Uncomment if you have this flag declared!
         usart_dma_receive(image_buffer, expected_size);
+        
         while(!dma_rx_complete) {
-            if (dma_rx_error) {
-                break;
-            }
-            __asm__("nop"); // small sleep or just nop
+            if (dma_rx_error) break;
+            __asm__("nop"); 
         }
         
         if (dma_rx_error) {
@@ -126,62 +142,70 @@ int main(void) {
             gfx_setTextColor(0xFFFF, 0xF800);
             gfx_puts((char*)"DMA ERROR         ");
             lcd_show_frame();
-            for(int j=0; j<2000000; j++) __asm__("nop"); // delay to show error
+            for(int j=0; j<2000000; j++) __asm__("nop"); 
             continue;
         }
 
-        // 5. Process (LED ON)
+        // 5. Populate TFLite Tensor
         gpio_set(GPIOG, GPIO13);
-
-        gfx_setCursor(10, 30);
-        gfx_setTextColor(0xFFFF, 0x0000);
-        gfx_puts((char*)"PROCESSING...     ");
-        lcd_show_frame();
-        
-        // Copy image_buffer to TFLite input tensor and draw to LCD (scaled by 2)
-        int draw_x_offset = (GFX_WIDTH - 192) / 2; // scale by 2 horizontally
-        int draw_y_offset = (GFX_HEIGHT - 192) / 2; // scale by 2 vertically
-
         for (int y = 0; y < 96; y++) {
             for (int x = 0; x < 96; x++) {
-                int i = y * 96 + x;
-                uint8_t pixel = image_buffer[i];
-                input->data.int8[i] = (int8_t)((int16_t)pixel - 128);
+                int base_idx = (y * 96 + x) * 3;
+                uint8_t r = image_buffer[base_idx];
+                uint8_t g = image_buffer[base_idx + 1];
+                uint8_t b = image_buffer[base_idx + 2];
                 
-                // Convert 8-bit grayscale to 16-bit RGB565 correctly
-                uint16_t raw_color = ((pixel >> 3) << 11) | ((pixel >> 2) << 5) | (pixel >> 3);
+                if (input->bytes == 27648) { // 3-channel (RGB) model
+                    input->data.int8[base_idx]     = (int8_t)((int16_t)r - 128);
+                    input->data.int8[base_idx + 1] = (int8_t)((int16_t)g - 128);
+                    input->data.int8[base_idx + 2] = (int8_t)((int16_t)b - 128);
+                } else { // Fallback for 1-channel (Grayscale) models
+                    uint8_t gray = (r * 77 + g * 150 + b * 29) >> 8;
+                    input->data.int8[y * 96 + x] = (int8_t)((int16_t)gray - 128);
+                }
+            }
+        }
+
+        // 6. Draw the image FULLSCREEN (320x240) using nearest-neighbor scaling
+        // Each screen pixel maps back to its corresponding 96x96 source pixel.
+        for (int sy = 0; sy < GFX_HEIGHT; sy++) {
+            int src_y = src_y_lut[sy];
+            for (int sx = 0; sx < GFX_WIDTH; sx++) {
+                int src_x = src_x_lut[sx];
+                int base_idx = (src_y * 96 + src_x) * 3;
+                uint8_t r = image_buffer[base_idx];
+                uint8_t g = image_buffer[base_idx + 1];
+                uint8_t b = image_buffer[base_idx + 2];
+                
+                uint16_t raw_color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
                 // Cortex-M4 is Little-Endian, ILI9341 SPI expects Big-Endian pixels. Swap bytes!
                 uint16_t color = (raw_color >> 8) | (raw_color << 8);
-
-                // Draw 2x2 scaled block
-                lcd_draw_pixel(draw_x_offset + x*2, draw_y_offset + y*2, color);
-                lcd_draw_pixel(draw_x_offset + x*2 + 1, draw_y_offset + y*2, color);
-                lcd_draw_pixel(draw_x_offset + x*2, draw_y_offset + y*2 + 1, color);
-                lcd_draw_pixel(draw_x_offset + x*2 + 1, draw_y_offset + y*2 + 1, color);
+                
+                lcd_draw_pixel(sx, sy, color);
             }
         }
 
         interpreter.Invoke();
 
-        // 6. Display and Response
+        // 7. Display and Response - overlay text on the fullscreen image
         int8_t no_person_score = output->data.int8[0];
         int8_t person_score = output->data.int8[1];
         bool is_person = person_score > no_person_score;
 
         char dbg_buf[64];
         sprintf(dbg_buf, "P: %d NP: %d    ", person_score, no_person_score);
-        gfx_setCursor(10, 50);
+        gfx_setCursor(10, 10);
         gfx_setTextColor(0xFFFF, 0x0000);
         gfx_puts(dbg_buf);
 
-        // Draw classification label nicely below the scaled image
-        gfx_setCursor(draw_x_offset, draw_y_offset + 192 + 15);
+        // Draw classification label at the bottom of the fullscreen image
+        gfx_setCursor(10, GFX_HEIGHT - 20);
         if (is_person) {
             gfx_setTextColor(0x07E0, 0x0000); // Green
-            gfx_puts((char*)"PERSON      ");
+            gfx_puts((char*)"PERSON ");
         } else {
             gfx_setTextColor(0xF800, 0x0000); // Red
-            gfx_puts((char*)"NO PERSON   ");
+            gfx_puts((char*)"NO PERSON ");
         }
 
         lcd_show_frame(); 

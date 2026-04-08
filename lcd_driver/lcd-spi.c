@@ -126,7 +126,7 @@ static const uint8_t cmd_args[] = {
 	0x90,
 /*    0xc8,*/                 /* original */
 /*                  11001000 = MY, MX, BGR */
-	0x08,
+	0xA8,
 	0xc2,
 	0x55,
 	0x0a, 0xa7, 0x27, 0x04,
@@ -339,7 +339,7 @@ lcd_spi_init(void)
 	initialize_display(initialization);
 
 	/* create a test image */
-	console_puts("Generating Test Image\n");
+	// console_puts("Generating Test Image\n");
 	// test_image();
 
 	/* display it on the LCD */
