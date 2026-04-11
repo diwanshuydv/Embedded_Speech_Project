@@ -2,3 +2,5 @@
 *.elf
 *.bin
 .vscode/
+venv/
+*.jpg

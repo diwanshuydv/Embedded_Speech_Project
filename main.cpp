@@ -20,14 +20,14 @@ extern "C" int _write(int file, char *ptr, int len) {
 }
 
 
+#include <cstring>
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "model_data.h" 
+#include "model_speech.h" 
 
 #define SDRAM_BASE 0xD0000000
-#define IMG_MAX 27648 
-uint8_t* image_buffer = (uint8_t*)(SDRAM_BASE + 0x80000); // offset by 512KB for LCD buffer protection
-
+#define AUDIO_MAX_BYTES 32000
+uint8_t* audio_buffer = (uint8_t*)(SDRAM_BASE + 0x80000); // offset by 512KB for LCD buffer protection
 
 // 🔥 SAFETY FIX: Move Arena to 1MB offset to avoid LCD Buffer collision
 constexpr int kTensorArenaSize = 150 * 1024;
@@ -40,7 +40,108 @@ uint16_t gray_to_rgb565(uint8_t gray) {
     return (r << 11) | (g << 5) | b;
 }
 
-// ... [Includes and externs remain the same] ...
+constexpr int kQuestionCount = 4;
+constexpr int kEndingCount = 16;
+
+const char* kSpeechQuestions[kQuestionCount] = {
+    "Question 1: Is it alive?",
+    "Question 2: Is it indoors?",
+    "Question 3: Is it small?",
+    "Question 4: Do you want it?"
+};
+
+const char* kSpeechEndings[kEndingCount] = {
+    "Result A: No/No/No/No","Result B: No/No/No/Yes",
+    "Result C: No/No/Yes/No","Result D: No/No/Yes/Yes",
+    "Result E: No/Yes/No/No","Result F: No/Yes/No/Yes",
+    "Result G: No/Yes/Yes/No","Result H: No/Yes/Yes/Yes",
+    "Result I: Yes/No/No/No","Result J: Yes/No/No/Yes",
+    "Result K: Yes/No/Yes/No","Result L: Yes/No/Yes/Yes",
+    "Result M: Yes/Yes/No/No","Result N: Yes/Yes/No/Yes",
+    "Result O: Yes/Yes/Yes/No","Result P: Yes/Yes/Yes/Yes"
+};
+
+const char* kSpeechLabels[] = {
+    "silence","unknown","yes","no","up","down","left","right",
+    "on","off","stop","go"
+};
+constexpr int kSpeechLabelCount = sizeof(kSpeechLabels) / sizeof(kSpeechLabels[0]);
+
+static void drawCenteredText(const char* title, const char* line1, const char* line2) {
+    gfx_fillScreen(0x0000);
+    gfx_setCursor(10, 10);
+    gfx_setTextColor(0xFFFF, 0x0000);
+    gfx_puts((char*)title);
+    gfx_setCursor(10, 50);
+    gfx_puts((char*)line1);
+    gfx_setCursor(10, 90);
+    gfx_puts((char*)line2);
+    lcd_show_frame();
+}
+
+static bool fillAudioInput(TfLiteTensor* input, uint8_t* buffer, uint16_t size) {
+    if (input->type == kTfLiteInt16) {
+        int copy_bytes = size;
+        if (copy_bytes > input->bytes) copy_bytes = input->bytes;
+        memcpy(input->data.i16, buffer, copy_bytes);
+        return true;
+    }
+    if (input->type == kTfLiteInt8) {
+        int sample_count = input->bytes;
+        int16_t* src = reinterpret_cast<int16_t*>(buffer);
+        for (int i = 0; i < sample_count; ++i) {
+            int16_t sample = 0;
+            if ((i * 2 + 1) < size) {
+                sample = (int16_t)(buffer[i*2] | (buffer[i*2 + 1] << 8));
+            }
+            input->data.int8[i] = (int8_t)(sample >> 8);
+        }
+        return true;
+    }
+    if (input->type == kTfLiteUInt8) {
+        int sample_count = input->bytes;
+        for (int i = 0; i < sample_count; ++i) {
+            uint8_t sample = 128;
+            if ((i * 2 + 1) < size) {
+                sample = (uint8_t)((buffer[i*2] | (buffer[i*2 + 1] << 8)) >> 8) + 128;
+            }
+            input->data.uint8[i] = sample;
+        }
+        return true;
+    }
+    return false;
+}
+
+static int findLabelIndex(const TfLiteTensor* output) {
+    int count = 0;
+    if (output->type == kTfLiteInt8) count = output->bytes;
+    else if (output->type == kTfLiteUInt8) count = output->bytes;
+    else count = output->bytes;
+    if (count <= 0) return -1;
+
+    int best = -1;
+    int best_score = -128;
+    if (output->type == kTfLiteInt8) {
+        for (int i = 0; i < count; ++i) {
+            int8_t score = output->data.int8[i];
+            if (score > best_score) {
+                best_score = score;
+                best = i;
+            }
+        }
+    } else if (output->type == kTfLiteUInt8) {
+        int best_u = -1;
+        for (int i = 0; i < count; ++i) {
+            uint8_t score = output->data.uint8[i];
+            if (best < 0 || score > best_u) {
+                best_u = score;
+                best = i;
+            }
+        }
+    }
+    if (best < 0 || best >= kSpeechLabelCount) return best;
+    return best;
+}
 
 int main(void) {
     clock_setup(); 
@@ -58,11 +159,19 @@ int main(void) {
     gfx_init(lcd_draw_pixel, GFX_WIDTH, GFX_HEIGHT);
     
     // --- BREADCRUMB 2: AI INIT ---
-    const tflite::Model* model = tflite::GetModel(person_detect_tflite); 
+    const tflite::Model* model = tflite::GetModel(micro_speech_quantized_tflite);
     
-    tflite::MicroMutableOpResolver<6> resolver;
-    resolver.AddAveragePool2D(); resolver.AddConv2D();
-    resolver.AddDepthwiseConv2D(); resolver.AddReshape(); resolver.AddSoftmax();
+    // The speech model may use Conv2D, Relu, Reshape, FullyConnected, and Softmax.
+    // If necessary, add more ops later once model debug is complete.
+    tflite::MicroMutableOpResolver<8> resolver;
+    resolver.AddConv2D();
+    resolver.AddDepthwiseConv2D();
+    resolver.AddRelu();
+    resolver.AddReshape();
+    resolver.AddFullyConnected();
+    resolver.AddSoftmax();
+    resolver.AddAdd();
+    resolver.AddMul();
 
     // --- BREADCRUMB 3: ARENA ALLOCATION ---
     // If the board crashes here, your SDRAM base address is wrong
@@ -88,133 +197,166 @@ int main(void) {
     gfx_puts((char*)"AI INIT SUCCESS");
     
     TfLiteTensor* input = interpreter.input(0);
-    TfLiteTensor* output = interpreter.output(0); 
-    
-    // Pre-compute lookup tables for nearest-neighbor scaling 96 -> 320 and 96 -> 240
-    // This maps each screen pixel back to its source pixel in the 96x96 image.
-    uint8_t src_x_lut[GFX_WIDTH];   // 320 entries
-    uint8_t src_y_lut[GFX_HEIGHT];  // 240 entries
-    for (int sx = 0; sx < GFX_WIDTH; sx++)
-        src_x_lut[sx] = (uint8_t)((sx * 96) / GFX_WIDTH);
-    for (int sy = 0; sy < GFX_HEIGHT; sy++)
-        src_y_lut[sy] = (uint8_t)((sy * 96) / GFX_HEIGHT);
-    
+    TfLiteTensor* output = interpreter.output(0);
+
+    int question_index = 0;
+    uint8_t branch_path = 0;
+    const char* last_label = "waiting";
+    const char* status_text = "Say yes or no";
+
     while (1) {
-       gfx_setCursor(10, 30);
+        gfx_fillScreen(0x0000);
+        gfx_setCursor(10, 10);
         gfx_setTextColor(0xFFFF, 0x0000);
-        gfx_puts((char*)"WAITING FOR SERIAL INPUT ");
+        gfx_puts((char*)"AUDIO QUESTION MODE");
 
-        // 🔥 FIX 1: The FLUSH block is completely deleted.
+        gfx_setCursor(10, 50);
+        if (question_index < kQuestionCount) {
+            gfx_puts((char*)kSpeechQuestions[question_index]);
+        } else {
+            gfx_puts((char*)"QUESTIONNAIRE COMPLETE");
+        }
 
-        // 🔥 FIX 2: Sliding-window header search. 
-        // It safely chews through garbage bytes until it perfectly locks onto 0xAA 0x55.
+        gfx_setCursor(10, 90);
+        gfx_puts((char*)"Last label:");
+        gfx_setCursor(10, 110);
+        gfx_puts((char*)last_label);
+
+        gfx_setCursor(10, 150);
+        gfx_puts((char*)status_text);
+        lcd_show_frame();
+
         uint8_t sync1 = 0;
         uint8_t sync2 = 0;
         while (true) {
             sync1 = sync2;
             sync2 = (uint8_t)usart_read_char();
             if (sync1 == 0xAA && sync2 == 0x55) {
-                break; // Header locked!
+                break;
             }
         }
 
-        // 3. Header confirmed. Read Size (2 bytes)
         uint8_t size_low = usart_read_char();
         uint8_t size_high = usart_read_char();
         uint16_t expected_size = (size_high << 8) | size_low;
 
-        if (expected_size != 27648) {
-            continue; // Wrong size, wait for the next frame
-        }
-
-        // 4. Read Pixels using DMA
-        dma_rx_complete = 0;
-        // dma_rx_error = 0; // 🔥 Uncomment if you have this flag declared!
-        usart_dma_receive(image_buffer, expected_size);
-        
-        while(!dma_rx_complete) {
-            if (dma_rx_error) break;
-            __asm__("nop"); 
-        }
-        
-        if (dma_rx_error) {
-            gfx_setCursor(10, 30);
+        if (expected_size == 0 || expected_size > AUDIO_MAX_BYTES) {
+            gfx_fillScreen(0xF800);
+            gfx_setCursor(10, 10);
             gfx_setTextColor(0xFFFF, 0xF800);
-            gfx_puts((char*)"DMA ERROR         ");
+            gfx_puts((char*)"BAD AUDIO SIZE");
             lcd_show_frame();
-            for(int j=0; j<2000000; j++) __asm__("nop"); 
             continue;
         }
 
-        // 5. Populate TFLite Tensor
+        dma_rx_complete = 0;
+        dma_rx_error = false;
+        usart_dma_receive(audio_buffer, expected_size);
+        while (!dma_rx_complete) {
+            if (dma_rx_error) break;
+            __asm__("nop");
+        }
+
+        if (dma_rx_error) {
+            gfx_fillScreen(0xF800);
+            gfx_setCursor(10, 10);
+            gfx_setTextColor(0xFFFF, 0x0000);
+            gfx_puts((char*)"DMA ERROR");
+            lcd_show_frame();
+            continue;
+        }
+
+        if (!fillAudioInput(input, audio_buffer, expected_size)) {
+            gfx_fillScreen(0xF800);
+            gfx_setCursor(10, 10);
+            gfx_setTextColor(0xFFFF, 0x0000);
+            gfx_puts((char*)"AUDIO INPUT FAIL");
+            lcd_show_frame();
+            continue;
+        }
+
         gpio_set(GPIOG, GPIO13);
-        for (int y = 0; y < 96; y++) {
-            for (int x = 0; x < 96; x++) {
-                int base_idx = (y * 96 + x) * 3;
-                uint8_t r = image_buffer[base_idx];
-                uint8_t g = image_buffer[base_idx + 1];
-                uint8_t b = image_buffer[base_idx + 2];
-                
-                if (input->bytes == 27648) { // 3-channel (RGB) model
-                    input->data.int8[base_idx]     = (int8_t)((int16_t)r - 128);
-                    input->data.int8[base_idx + 1] = (int8_t)((int16_t)g - 128);
-                    input->data.int8[base_idx + 2] = (int8_t)((int16_t)b - 128);
-                } else { // Fallback for 1-channel (Grayscale) models
-                    uint8_t gray = (r * 77 + g * 150 + b * 29) >> 8;
-                    input->data.int8[y * 96 + x] = (int8_t)((int16_t)gray - 128);
-                }
-            }
+        if (interpreter.Invoke() != kTfLiteOk) {
+            gpio_clear(GPIOG, GPIO13);
+            gfx_fillScreen(0xF800);
+            gfx_setCursor(10, 10);
+            gfx_setTextColor(0xFFFF, 0x0000);
+            gfx_puts((char*)"INFERENCE FAIL");
+            lcd_show_frame();
+            continue;
         }
+        gpio_clear(GPIOG, GPIO13);
 
-        // 6. Draw the image FULLSCREEN (320x240) using nearest-neighbor scaling
-        // Each screen pixel maps back to its corresponding 96x96 source pixel.
-        for (int sy = 0; sy < GFX_HEIGHT; sy++) {
-            int src_y = src_y_lut[sy];
-            for (int sx = 0; sx < GFX_WIDTH; sx++) {
-                int src_x = src_x_lut[sx];
-                int base_idx = (src_y * 96 + src_x) * 3;
-                uint8_t r = image_buffer[base_idx];
-                uint8_t g = image_buffer[base_idx + 1];
-                uint8_t b = image_buffer[base_idx + 2];
-                
-                uint16_t raw_color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
-                // Cortex-M4 is Little-Endian, ILI9341 SPI expects Big-Endian pixels. Swap bytes!
-                uint16_t color = (raw_color >> 8) | (raw_color << 8);
-                
-                lcd_draw_pixel(sx, sy, color);
-            }
-        }
-
-        interpreter.Invoke();
-
-        // 7. Display and Response - overlay text on the fullscreen image
-        int8_t no_person_score = output->data.int8[0];
-        int8_t person_score = output->data.int8[1];
-        bool is_person = person_score > no_person_score;
-
-        char dbg_buf[64];
-        sprintf(dbg_buf, "P: %d NP: %d    ", person_score, no_person_score);
-        gfx_setCursor(10, 10);
-        gfx_setTextColor(0xFFFF, 0x0000);
-        gfx_puts(dbg_buf);
-
-        // Draw classification label at the bottom of the fullscreen image
-        gfx_setCursor(10, GFX_HEIGHT - 20);
-        if (is_person) {
-            gfx_setTextColor(0x07E0, 0x0000); // Green
-            gfx_puts((char*)"PERSON ");
+        int label_idx = findLabelIndex(output);
+        if (label_idx >= 0 && label_idx < kSpeechLabelCount) {
+            last_label = kSpeechLabels[label_idx];
         } else {
-            gfx_setTextColor(0xF800, 0x0000); // Red
-            gfx_puts((char*)"NO PERSON ");
+            last_label = "unknown";
+            label_idx = -1;
         }
 
-        lcd_show_frame(); 
+        bool heard_yes = (label_idx == 2);
+        bool heard_no = (label_idx == 3);
+        uint8_t result_code = 2;
 
-        // Send Result (Only 3 bytes: 0xBB 0x66 Result)
+        if (heard_yes) {
+            result_code = 1;
+        } else if (heard_no) {
+            result_code = 0;
+        }
+
+        if (question_index < kQuestionCount) {
+            if (heard_yes) {
+                branch_path = (branch_path << 1) | 1;
+                question_index++;
+                status_text = "Heard YES";
+            } else if (heard_no) {
+                branch_path = (branch_path << 1);
+                question_index++;
+                status_text = "Heard NO";
+            } else {
+                status_text = "Unknown, please repeat";
+            }
+        }
+
+        if (question_index >= kQuestionCount) {
+            gfx_fillScreen(0x001F);
+            gfx_setCursor(10, 10);
+            gfx_setTextColor(0xFFFF, 0x001F);
+            gfx_puts((char*)"QUESTIONNAIRE COMPLETE");
+            gfx_setCursor(10, 50);
+            gfx_puts((char*)kSpeechEndings[branch_path]);
+            gfx_setCursor(10, 90);
+            gfx_puts((char*)"Say anything to replay");
+            lcd_show_frame();
+            if (heard_yes || heard_no) {
+                question_index = 0;
+                branch_path = 0;
+                status_text = "Restarting...";
+            }
+        } else {
+            gfx_fillScreen(0x0000);
+            gfx_setCursor(10, 10);
+            gfx_setTextColor(0xFFFF, 0x0000);
+            gfx_puts((char*)"AUDIO QUESTION MODE");
+            gfx_setCursor(10, 50);
+            gfx_puts((char*)kSpeechQuestions[question_index]);
+            gfx_setCursor(10, 90);
+            gfx_puts((char*)"Last label:");
+            gfx_setCursor(10, 110);
+            gfx_puts((char*)last_label);
+            gfx_setCursor(10, 150);
+            gfx_puts((char*)status_text);
+            lcd_show_frame();
+        }
+
         usart_send_blocking(USART1, 0xBB);
         usart_send_blocking(USART1, 0x66);
-        usart_send_blocking(USART1, is_person ? 1 : 0);
-
-        gpio_clear(GPIOG, GPIO13);
+        usart_send_blocking(USART1, result_code);
+        if (question_index >= kQuestionCount) {
+            usart_send_blocking(USART1, 0xBB);
+            usart_send_blocking(USART1, 0x67);
+            usart_send_blocking(USART1, branch_path);
+        }
     }
 }
