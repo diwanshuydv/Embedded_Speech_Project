@@ -36,10 +36,10 @@ void gpio_setup(void){
     /* Setup GPIO pin GPIO13 on GPIO port G for LED. */
     gpio_mode_setup(GPIOG, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO13);
 
-    /* 🔥 FIX: Setup GPIO pins for USART1 transmit (PA9) AND receive (PA10). */
+    /* Setup GPIO pins for USART1 transmit (PA9) AND receive (PA10). */
     gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO9 | GPIO10);
 
-    /* 🔥 FIX: Setup USART1 TX/RX pins as alternate function 7. */
+    /* Setup USART1 TX/RX pins as alternate function 7. */
     gpio_set_af(GPIOA, GPIO_AF7, GPIO9 | GPIO10);
 }
 

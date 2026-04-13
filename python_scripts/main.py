@@ -1,34 +1,12 @@
-import argparse
-import glob
-import serial
-import struct
-import sys
-import time
+import cv2, serial, struct, time, numpy as np, glob, sys
 
-try:
-    import sounddevice as sd
-except ImportError:
-    print("Error: sounddevice module is required. Install it with 'python3 -m pip install sounddevice'.")
-    sys.exit(1)
-
-import numpy as np
-
-DEFAULT_SAMPLE_RATE = 16000
-DEFAULT_DURATION = 1.0
-CHUNK_SIZE = 1024
-
-parser = argparse.ArgumentParser(description="Stream microphone audio to STM32 for keyword recognition")
-parser.add_argument('--duration', type=float, default=DEFAULT_DURATION, help='Seconds to record per query')
-parser.add_argument('--samplerate', type=int, default=DEFAULT_SAMPLE_RATE, help='Audio sample rate')
-parser.add_argument('--port', type=str, default=None, help='Serial port to use')
-args = parser.parse_args()
-
+# Find the appropriate serial port automatically
 ports = glob.glob("/dev/cu.usbmodem*")
-if not ports and not args.port:
-    print("Error: No STM32 device found matching /dev/cu.usbmodem*. Provide --port if necessary.")
+if not ports:
+    print("Error: No STM32 device found matching /dev/cu.usbmodem*")
     sys.exit(1)
 
-port_name = args.port if args.port else ports[0]
+port_name = ports[0]
 print(f"Connecting to {port_name}...")
 
 ser = serial.Serial(port_name, 115200, timeout=0.1)
@@ -41,18 +19,38 @@ while True:
         line = ser.readline().decode('utf-8', errors='ignore')
         print(line, end="")
         if "READY_TO_RECEIVE" in line:
-            print("\n✅ STM32 is READY. Starting audio stream...")
+            print("\n✅ STM32 is READY. Starting Stream...")
             break
     time.sleep(0.01)
 
-print(f"Recording {args.duration} seconds @ {args.samplerate} Hz")
+# 🔥 FIX 1: Open the camera exactly ONCE outside the loop.
+cap = cv2.VideoCapture(0)
+# Optional: Ask OpenCV to minimize its internal ring buffer
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+# Give the hardware sensor 2 seconds to turn on, adjust auto-exposure, and fix white-balance
+print("Warming up camera...")
+time.sleep(2) 
 
 while True:
-    print("Recording...")
-    audio = sd.rec(int(args.duration * args.samplerate), samplerate=args.samplerate, channels=1, dtype='int16')
-    sd.wait()
-    pcm = audio.flatten().tobytes()
+    # 🔥 FIX 2: Drain the OS ring buffer to guarantee we get a real-time frame
+    # Calling grab() is extremely fast because it doesn't decode the image pixels
+    for _ in range(5):
+        cap.grab()
+    
+    ret, frame = cap.read()
+    
+    if not ret: 
+        print("Camera read failed.")
+        time.sleep(1)
+        continue
 
+    # Preprocess (This will now consistently convert BGR -> RGB without glitching)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    small = cv2.resize(rgb, (96, 96))
+    img_data = small.flatten().tobytes()
+
+    # Forcefully drain any leftover bytes in the OS queue
     if hasattr(ser, 'read_all'):
         ser.read_all()
     else:
@@ -60,44 +58,32 @@ while True:
     ser.reset_input_buffer()
     ser.reset_output_buffer()
 
-    header = b'\xAA\x55' + struct.pack('<H', len(pcm))
-    print("Sending audio packet...", end="", flush=True)
+    # 📤 SEND HEADER
+    header = b'\xAA\x55' + struct.pack('<H', len(img_data))
+    print(f"Sending Frame...", end="", flush=True)
     ser.write(header)
     ser.flush()
-    time.sleep(0.01)
-
-    chunk_size = 256
-    for i in range(0, len(pcm), chunk_size):
-        ser.write(pcm[i:i+chunk_size])
-        time.sleep(0.005)
-
+    time.sleep(0.05) 
+    
+    # 📤 SEND ALL PIXELS IN CHUNKS
+    chunk_size = 128
+    for i in range(0, len(img_data), chunk_size):
+        ser.write(img_data[i:i+chunk_size])
+        time.sleep(0.011)
+        
     ser.flush()
-    print(" sent. Waiting for inference result...")
+    print(" Sent. Waiting for AI...")
 
+    # 📥 WAIT FOR AI RESULT
     start_time = time.time()
     rx_buffer = bytearray()
-
+    
     while (time.time() - start_time) < 20.0:
         if ser.in_waiting > 0:
             rx_buffer.extend(ser.read(ser.in_waiting))
-            idx = rx_buffer.find(b'\xBB\x66')
-            if idx != -1 and idx + 2 < len(rx_buffer):
-                code = rx_buffer[idx + 2]
-                if code == 0:
-                    label = 'NO'
-                elif code == 1:
-                    label = 'YES'
-                elif code == 2:
-                    label = 'UNKNOWN'
-                else:
-                    label = f'CODE_{code}'
-                print(f"🤖 INFERENCE: {label}")
-                end_idx = rx_buffer.find(b'\xBB\x67', idx + 3)
-                if end_idx != -1 and end_idx + 2 < len(rx_buffer):
-                    leaf = rx_buffer[end_idx + 2]
-                    print(f"📌 Branch path: {leaf:02b}")
-                print("")
-                break
-    else:
-        print("Timeout waiting for STM32 response.")
-    time.sleep(0.5)
+            if b'\xBB\x66' in rx_buffer:
+                idx = rx_buffer.find(b'\xBB\x66')
+                if idx + 2 < len(rx_buffer):
+                    res = "PERSON" if rx_buffer[idx+2] == 1 else "NONE"
+                    print(f"🤖 AI RESULT: {res}\n")
+                    break

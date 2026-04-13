@@ -1,5 +1,6 @@
 # ==========================================
 # Standalone STM32F429ZI Makefile (C/C++ Mixed)
+# Hey Kitty — Shape Drawing Firmware
 # ==========================================
 
 PROJECT = my_lcd_firmware
@@ -12,12 +13,8 @@ OPENCM3_DIR = libopencm3
 C_SOURCES = clock/clock.c console/console.c font/font-7x12.c \
             gfx/gfx.c lcd_driver/lcd-spi.c sdram/sdram.c usart/usart.c
 
-# Your application and ML code
-TFLM_SOURCES = $(shell find tflite-micro/tensorflow -name "*.cpp") \
-               $(shell find tflite-micro/third_party -name "*.cpp")
-CXX_SOURCES = main.cpp $(TFLM_SOURCES)
-
-
+# Application code only — TFLite removed
+CXX_SOURCES = main.cpp
 
 # Combine object files
 OBJS = $(C_SOURCES:.c=.o) $(CXX_SOURCES:.cpp=.o)
@@ -29,24 +26,19 @@ OBJCOPY = $(PREFIX)objcopy
 SIZE = $(PREFIX)size
 
 INCLUDES = -I$(OPENCM3_DIR)/include -Ilcd_driver -Iclock -Iconsole \
-           -Igfx -Isdram -Ifont -Iusart -I. \
-           -Itflite-micro \
-           -Itflite-micro/third_party/flatbuffers/include \
-           -Itflite-micro/third_party/gemmlowp \
-           -Itflite-micro/third_party/ruy
+           -Igfx -Isdram -Ifont -Iusart -I.
 
 # --- 2. COMPILER FLAGS ---
 # Common flags for both C and C++
 COMMON_FLAGS = -Os -g3 -Wall -Wextra $(INCLUDES) \
                -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -DSTM32F4 \
                -fdata-sections -ffunction-sections \
-               -DTF_LITE_STATIC_MEMORY -DNDEBUG
+               -DNDEBUG
 
 # C-specific flags
 CFLAGS = $(COMMON_FLAGS)
 
-# C++-specific flags (Crucial for TinyML on bare-metal)
-# C++-specific flags (Using GNU++ to support C99 Flexible Array Members)
+# C++-specific flags
 CXXFLAGS = $(COMMON_FLAGS) -std=gnu++14 -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-unwind-tables
 
 LDSCRIPT = stm32f429zi.ld

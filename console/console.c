@@ -41,7 +41,7 @@
  * read by the program. See the README file for a discussion of
  * the failure semantics.
  */
-#define RECV_BUF_SIZE	128		/* Arbitrary buffer size */
+#define RECV_BUF_SIZE	4096		/* Increased from 128 to prevent overrun during LCD drawing */
 char recv_buf[RECV_BUF_SIZE];
 volatile int recv_ndx_nxt;		/* Next place to store */
 volatile int recv_ndx_cur;		/* Next place to read */
