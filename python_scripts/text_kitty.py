@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Hello Kitty — Wake Word + Shape/Image Controller
-Uses Google Speech API for speech recognition.
+Text Kitty — Text-based Shape/Image Controller
 If the command matches a shape → draws it. Otherwise → searches web for an image
 and streams it to the STM32 LCD.
 
 Usage:
-    python3 hey_kitty.py [--port /dev/cu.usbmodemXXXX]
+    python3 text_kitty.py [--port /dev/cu.usbmodemXXXX]
 """
 
 import argparse
@@ -23,12 +22,6 @@ except ImportError:
     sys.exit(1)
 
 try:
-    import speech_recognition as sr
-except ImportError:
-    print("Error: SpeechRecognition is required. Install with: pip install SpeechRecognition")
-    sys.exit(1)
-
-try:
     from PIL import Image
 except ImportError:
     print("Error: Pillow is required. Install with: pip install Pillow")
@@ -39,6 +32,7 @@ try:
 except ImportError:
     print("Error: requests is required. Install with: pip install requests")
     sys.exit(1)
+
 
 # ============================================================
 #  Constants
@@ -72,16 +66,6 @@ SHAPE_MAP = {
     "oval":      0x0B,
 }
 
-# WAKE_PHRASES = [
-#     "hello kitty", "hello kittie", "hello kiddy", "hello kiddie",
-#     "hello katie", "hey kitty", "hey kittie", "hey kiddy",
-#     "a kitty", "aloha kitty",
-# ]
-WAKE_PHRASES = [
-    "hello", 
-    "hey ", "aloha ",
-]
-
 # ANSI colors
 class C:
     CYAN = "\033[96m"
@@ -93,6 +77,31 @@ class C:
     BOLD = "\033[1m"
     DIM = "\033[2m"
     END = "\033[0m"
+
+
+# ============================================================
+#  Parsing Helpers
+# ============================================================
+def parse_shape(text: str):
+    text = text.lower()
+    for name, shape_id in SHAPE_MAP.items():
+        if name in text:
+            return shape_id, name
+    return None, None
+
+def extract_search_query(text: str) -> str:
+    text = text.lower().strip()
+    for prefix in ["show me", "show", "display", "find", "search for",
+                   "search", "draw", "draw me", "get", "get me",
+                   "look up", "look for", "show me a", "show a",
+                   "i want", "i want to see", "can you show"]:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    for article in ["a ", "an ", "the ", "some "]:
+        if text.startswith(article):
+            text = text[len(article):]
+    return text.strip()
 
 
 # ============================================================
@@ -108,7 +117,7 @@ def search_image(query: str) -> str:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # 1st attempt: Wikipedia API (Mainly for objects/places/animals - high quality transparent images usually)
+    # 1st attempt: Wikipedia API
     try:
         wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(query)}&prop=pageimages|images&piprop=original&pilicense=any&format=json"
         resp = requests.get(wiki_url, headers=headers, timeout=5)
@@ -122,14 +131,13 @@ def search_image(query: str) -> str:
     except Exception as e:
         print(f"  {C.DIM}Wiki scrape error: {e}{C.END}")
 
-    # 2nd attempt: Bing Images scrape (lenient no-JS scraping)
+    # 2nd attempt: Bing Images scrape
     try:
         import html
         url = f"https://www.bing.com/images/search?q={urllib.parse.quote(query)}&first=1"
         resp = requests.get(url, headers=headers, timeout=5)
         text = html.unescape(resp.text)
         
-        # Bing embeds image data in a 'm' attribute on class='mimg' items or 'm' attribute JSON
         matches = re.findall(r'"murl":"(https?://[^"]+)"', text)
         if not matches:
             matches = re.findall(r'm="{.*?\"murl\":\"(https?://.*?)\"', resp.text)
@@ -138,19 +146,16 @@ def search_image(query: str) -> str:
             if u.lower().endswith((".jpg", ".png", ".jpeg", ".webp")):
                 return u
         
-        # fallback regex if first one fails
         urls = re.findall(r'https?://[^"\'<>&;\s]+\.(?:jpg|jpeg|png|webp)', text)
         for u in urls:
-             if "bing.com" not in u and "microsoft.com" not in u: # try not to get icons
+             if "bing.com" not in u and "microsoft.com" not in u:
                  return u
     except Exception as e:
         print(f"  {C.YELLOW}Bing scrape error: {e}{C.END}")
         
     return None
 
-
 def download_image(url: str) -> Image.Image:
-    """Download image from URL, return PIL Image."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                       "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -159,24 +164,17 @@ def download_image(url: str) -> Image.Image:
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content))
 
-
 def image_to_rgb565(img: Image.Image, width: int, height: int) -> bytes:
-    """Resize image and convert to RGB565 big-endian bytes."""
-    # Resize maintaining aspect ratio, then crop to exact size
     img = img.convert("RGB")
-    
-    # Scale to fit
     img_ratio = img.width / img.height
     target_ratio = width / height
     
     if img_ratio > target_ratio:
-        # Image is wider → crop sides
         new_h = img.height
         new_w = int(new_h * target_ratio)
         left = (img.width - new_w) // 2
         img = img.crop((left, 0, left + new_w, new_h))
     else:
-        # Image is taller → crop top/bottom
         new_w = img.width
         new_h = int(new_w / target_ratio)
         top = (img.height - new_h) // 2
@@ -184,7 +182,6 @@ def image_to_rgb565(img: Image.Image, width: int, height: int) -> bytes:
     
     img = img.resize((width, height), Image.LANCZOS)
     
-    # Convert to RGB565
     data = bytearray(width * height * 2)
     pixels = img.load()
     idx = 0
@@ -195,7 +192,6 @@ def image_to_rgb565(img: Image.Image, width: int, height: int) -> bytes:
             data[idx] = (rgb565 >> 8) & 0xFF
             data[idx + 1] = rgb565 & 0xFF
             idx += 2
-    
     return bytes(data)
 
 
@@ -240,14 +236,11 @@ class STM32Link:
         self.ser.flush()
     
     def send_image(self, pixel_data: bytes, width: int, height: int):
-        """Send image command + pixel data to STM32."""
-        # Header: SYNC + CMD_IMAGE + W + H
         header = SYNC + bytes([CMD_IMAGE, width, height])
         self.ser.write(header)
         self.ser.flush()
-        time.sleep(0.1)  # Let firmware set up receive buffer
+        time.sleep(0.1)
         
-        # Send pixel data in chunks with flow control
         total = len(pixel_data)
         chunk_size = 128
         sent = 0
@@ -257,9 +250,8 @@ class STM32Link:
             end = min(sent + chunk_size, total)
             self.ser.write(pixel_data[sent:end])
             sent = end
-            time.sleep(0.011)  # Vital flow control! Matches 115200 baud exactly.
+            time.sleep(0.011)
             
-            # Progress
             pct = sent * 100 // total
             bar = "█" * (pct // 2) + "░" * (50 - pct // 2)
             sys.stdout.write(f"\r  📡 [{bar}] {pct}% ({sent}/{total} bytes)")
@@ -284,134 +276,22 @@ class STM32Link:
 
 
 # ============================================================
-#  Speech Recognition
-# ============================================================
-class SpeechEngine:
-    def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 300
-        self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.8
-        self.mic = sr.Microphone()
-        
-        print(f"{C.CYAN}🎤 Calibrating microphone (2 seconds)...{C.END}")
-        with self.mic as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=2)
-        print(f"{C.GREEN}✓ Microphone ready (threshold: {int(self.recognizer.energy_threshold)}){C.END}")
-    
-    def listen_for_wake_word(self, stm32: STM32Link) -> bool:
-        while True:
-            try:
-                with self.mic as source:
-                    print(f"  {C.DIM}(listening...){C.END}", end="\r")
-                    audio = self.recognizer.listen(source, timeout=None, phrase_time_limit=4)
-                try:
-                    text = self.recognizer.recognize_google(audio).lower()
-                    print(f"  🎤 Heard: \"{text}\"")
-                    if self._check_wake_word(text):
-                        return True
-                except sr.UnknownValueError:
-                    pass
-                except sr.RequestError as e:
-                    print(f"  {C.RED}⚠ Google API error: {e}{C.END}")
-                    time.sleep(2)
-            except sr.WaitTimeoutError:
-                pass
-            stm32.drain_debug()
-    
-    def listen_for_command(self, timeout: float = 6.0) -> str:
-        try:
-            with self.mic as source:
-                print(f"  {C.DIM}(listening for command...){C.END}", end="\r")
-                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=5)
-            try:
-                text = self.recognizer.recognize_google(audio).lower()
-                print(f"  🎤 Command heard: \"{text}\"")
-                return text
-            except sr.UnknownValueError:
-                print(f"  {C.YELLOW}(couldn't understand){C.END}")
-                return ""
-            except sr.RequestError as e:
-                print(f"  {C.RED}⚠ API error: {e}{C.END}")
-                return ""
-        except sr.WaitTimeoutError:
-            print(f"  {C.YELLOW}(silence — timed out){C.END}")
-            return ""
-    
-    def _check_wake_word(self, text: str) -> bool:
-        text = text.lower().strip()
-        for phrase in WAKE_PHRASES:
-            if phrase in text:
-                return True
-        return False
-    
-    def parse_shape(self, text: str):
-        text = text.lower()
-        # Check for "draw <shape>" pattern first
-        for name, shape_id in SHAPE_MAP.items():
-            if name in text:
-                return shape_id, name
-        return None, None
-    
-    def extract_search_query(self, text: str) -> str:
-        """Extract meaningful search query from spoken command."""
-        text = text.lower().strip()
-        # Remove common prefixes
-        for prefix in ["show me", "show", "display", "find", "search for",
-                       "search", "draw", "draw me", "get", "get me",
-                       "look up", "look for", "show me a", "show a",
-                       "i want", "i want to see", "can you show"]:
-            if text.startswith(prefix):
-                text = text[len(prefix):].strip()
-                break
-        # Remove articles
-        for article in ["a ", "an ", "the ", "some "]:
-            if text.startswith(article):
-                text = text[len(article):]
-        return text.strip()
-
-
-# ============================================================
 #  Main
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Hello Kitty — Voice-controlled LCD shape/image display",
+        description="Text Kitty — Text-controlled LCD shape/image display",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Shapes: square, circle, triangle, rectangle, star, diamond,
-        pentagon, hexagon, heart, arrow, cross/plus, ellipse/oval
-
-If the command doesn't match a shape, it searches the web for an
-image and displays it on the LCD!
-
-Example:
-    python3 hey_kitty.py --port /dev/cu.usbmodem14203
-    
-    Say "Hello Kitty" → "draw square"    → draws a square
-    Say "Hello Kitty" → "show me a cat"  → searches & displays cat image!
-        """
     )
     parser.add_argument('--port', type=str, default=None,
                         help='Serial port (auto-detected if omitted)')
-    parser.add_argument('--list-mics', action='store_true',
-                        help='List available microphones and exit')
     args = parser.parse_args()
-    
-    if args.list_mics:
-        print("Available microphones:")
-        for i, name in enumerate(sr.Microphone.list_microphone_names()):
-            print(f"  [{i}] {name}")
-        sys.exit(0)
     
     # Header
     print(f"\n{C.BOLD}{C.CYAN}╔═══════════════════════════════════════════╗{C.END}")
-    print(f"{C.BOLD}{C.CYAN}║   🐱 Hello Kitty — Shape + Image Display  ║{C.END}")
-    print(f"{C.BOLD}{C.CYAN}║   🌐 Google Speech  +  Web Image Search   ║{C.END}")
+    print(f"{C.BOLD}{C.CYAN}║    📝 Text Kitty — Shape + Image Display  ║{C.END}")
+    print(f"{C.BOLD}{C.CYAN}║     Type commands to display on STM32     ║{C.END}")
     print(f"{C.BOLD}{C.CYAN}╚═══════════════════════════════════════════╝{C.END}\n")
-    
-    # Setup
-    speech = SpeechEngine()
     
     ports = glob.glob("/dev/cu.usbmodem*")
     if not ports and not args.port:
@@ -426,36 +306,28 @@ Example:
         print(f"{C.YELLOW}⚠ Proceeding without READY signal.{C.END}")
     
     print(f"\n{C.GREEN}{'='*55}{C.END}")
-    print(f"{C.GREEN}  ✅ Ready! Say \"Hello Kitty\" to begin.{C.END}")
+    print(f"{C.GREEN}  ✅ Ready!{C.END}")
     print(f"{C.GREEN}  📐 Shapes: square, circle, triangle, star, etc.{C.END}")
-    print(f"{C.GREEN}  🌐 Or say anything → web image search & display!{C.END}")
+    print(f"{C.GREEN}  🌐 Otherwise: web image search & display!{C.END}")
+    print(f"{C.GREEN}  Type 'quit' or 'exit' to stop.{C.END}")
     print(f"{C.GREEN}{'='*55}{C.END}\n")
     
     while True:
         try:
-            # IDLE: Listen for wake word
-            print(f"{C.CYAN}🐱 Listening for \"Hello Kitty\"...{C.END}")
-            speech.listen_for_wake_word(stm32)
-            
-            print(f"\n{C.BOLD}{C.GREEN}✨ Wake word detected!{C.END}")
+            print(f"{C.CYAN}📝 Enter command:{C.END}", end=" ")
+            command_text = input().strip()
+            if command_text.lower() in ["quit", "exit", "q"]:
+                raise KeyboardInterrupt
+            if not command_text:
+                continue
+
+            # Wake up sequence
             stm32.send_wake()
             time.sleep(0.3)
             stm32.drain_debug()
             
-            # LISTENING: Get command
-            print(f"{C.YELLOW}🎤 Say a shape or anything to search (6 sec)...{C.END}")
-            command_text = speech.listen_for_command(timeout=6.0)
-            
-            if not command_text:
-                print(f"{C.RED}⏰ No command heard. Back to idle.{C.END}")
-                stm32.send_timeout()
-                time.sleep(0.5)
-                stm32.drain_debug()
-                print()
-                continue
-            
             # Check if it's a shape
-            shape_id, shape_name = speech.parse_shape(command_text)
+            shape_id, shape_name = parse_shape(command_text)
             if shape_id is not None:
                 print(f"{C.BOLD}{C.MAGENTA}🎨 Drawing: {shape_name.upper()}{C.END}")
                 stm32.send_shape(shape_id)
@@ -465,7 +337,7 @@ Example:
                 time.sleep(2.0)
             else:
                 # NOT a shape → search web for image!
-                query = speech.extract_search_query(command_text)
+                query = extract_search_query(command_text)
                 if not query:
                     query = command_text
                 
@@ -480,11 +352,9 @@ Example:
                         pil_img = download_image(image_url)
                         print(f"  {C.GREEN}✓ Downloaded ({pil_img.width}x{pil_img.height}){C.END}")
                         
-                        # Convert to RGB565
                         print(f"  {C.CYAN}🔄 Converting to {IMG_W}x{IMG_H} RGB565...{C.END}")
                         pixel_data = image_to_rgb565(pil_img, IMG_W, IMG_H)
                         
-                        # Send to STM32
                         print(f"  {C.CYAN}📡 Streaming to LCD...{C.END}")
                         stm32.send_image(pixel_data, IMG_W, IMG_H)
                         
@@ -504,6 +374,9 @@ Example:
             stm32.drain_debug()
             print()
             
+        except EOFError:
+            print(f"\n{C.YELLOW}👋 Goodbye!{C.END}")
+            break
         except KeyboardInterrupt:
             print(f"\n{C.YELLOW}👋 Goodbye!{C.END}")
             try:
